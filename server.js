@@ -4,9 +4,8 @@ const http = require("http");
 const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
-const mysql = require("mysql2/promise"); // Untuk koneksi MySQL
+const mysql = require("mysql2/promise");
 
-// Konfigurasi dari environment variables
 require("dotenv").config();
 
 const PHP_API_TOKEN =
@@ -28,7 +27,6 @@ const io = new Server(httpServer, {
 app.use(express.json());
 app.use(cors({ origin: VUE_APP_ORIGIN }));
 
-// Konfigurasi Koneksi Database MySQL
 const dbConfig = {
   host: process.env.DB_HOST || "127.0.0.1",
   user: process.env.DB_USER || "root",
@@ -53,6 +51,7 @@ async function initializeDbPool() {
     );
     connection.release();
   } catch (error) {
+    // ... (error handling sudah ada) ...
     console.error(
       `[${new Date().toISOString()}] GAGAL terhubung ke database MySQL: ${
         error.message
@@ -79,41 +78,103 @@ function getSevenDayArray(
   default_value = 0
 ) {
   const output = Array(7).fill(default_value);
-  const today = new Date();
+  const today = new Date(); // Menggunakan "hari ini" dari server Node.js
+  // Set jam ke tengah hari untuk menghindari masalah pergantian hari/DST saat mengurangi hari
+  today.setHours(12, 0, 0, 0);
+
   const dates_map = {};
   for (let i = 6; i >= 0; i--) {
-    const date = new Date(today);
-    date.setDate(today.getDate() - i);
+    const date = new Date(today.getTime()); // Buat instance Date baru
+    date.setDate(today.getDate() - i); // Kurangi hari dari "today" yang sudah distabilkan
     const dateString = `${date.getFullYear()}-${String(
       date.getMonth() + 1
     ).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-    dates_map[dateString] = 6 - i;
+    dates_map[dateString] = 6 - i; // index 0 = H-6, index 6 = Hari Ini
   }
+  // Aktifkan log ini untuk melihat peta tanggal yang dibuat oleh Node.js
+  // console.log(`[getSevenDayArray] Peta Tanggal (Node.js time):`, dates_map);
 
   (results || []).forEach((row) => {
-    // Pastikan results adalah array
-    const day_str = row[date_key];
+    const day_str = row[date_key]; // Format YYYY-MM-DD dari MySQL
+    // Aktifkan log ini untuk melihat setiap baris dari SQL dan bagaimana ia diproses
+    // console.log(`[getSevenDayArray] Memproses baris SQL: log_day="${day_str}", ${value_key}="${row[value_key]}"`);
     if (day_str && dates_map.hasOwnProperty(day_str)) {
       const output_idx = dates_map[day_str];
-      output[output_idx] = parseFloat(
-        parseFloat(row[value_key] || default_value).toFixed(2)
-      );
+      let val = parseInt(row[value_key], 10); // Gunakan parseInt untuk jumlah/count
+      if (isNaN(val)) {
+        val = default_value;
+      }
+      output[output_idx] = val;
+    } else {
+      // Aktifkan log ini jika tanggal dari SQL tidak ditemukan di peta tanggal Node.js
+      // console.log(`[getSevenDayArray] PERINGATAN: Tanggal "${day_str}" dari SQL tidak ditemukan di dates_map atau null.`);
     }
   });
+  // Aktifkan log ini untuk melihat output akhir dari getSevenDayArray
+  // console.log(`[getSevenDayArray] Output akhir:`, output);
   return output;
 }
 
-// Variabel untuk menyimpan data terakhir yang dikirim
-const lastSentPayloads = {
-  all_with_logs: "",
-  single_latest: null,
-  all_robots_simple: "",
-  robot_detail: {}, // Menggunakan objek untuk menyimpan per ID: { "data_ROBOTID": payload, "error_ROBOTID": payload }
-};
+// ... (lastSentPayloads, getRobotOperationalMetrics tidak berubah, sudah benar) ...
+async function getRobotOperationalMetrics(robotId) {
+  const [operationDurationData] = await pool.query(
+    "SELECT MIN(created_at) AS first_order_time, MAX(created_at) AS last_order_time, COUNT(DISTINCT DATE(created_at)) AS total_active_days FROM orders WHERE robot_id = ?",
+    [robotId]
+  );
 
-// --- Fungsi Pengambilan Data (Adaptasi dari logika di StreamController PHP) ---
+  let operatingTimeInfo = {
+    durationText: "N/A",
+    totalActiveDays: 0,
+  };
+
+  if (
+    operationDurationData &&
+    operationDurationData.length > 0 &&
+    operationDurationData[0].first_order_time
+  ) {
+    const firstOrder = new Date(operationDurationData[0].first_order_time);
+    const lastOrder = new Date(operationDurationData[0].last_order_time);
+    operatingTimeInfo.totalActiveDays = parseInt(
+      operationDurationData[0].total_active_days || 0,
+      10
+    );
+
+    if (!isNaN(firstOrder.getTime()) && !isNaN(lastOrder.getTime())) {
+      const diffMs = lastOrder - firstOrder;
+      const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      const diffHrs = Math.floor(
+        (diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60)
+      );
+      const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+      operatingTimeInfo.durationText = `${diffDays} hari, ${diffHrs} jam, ${diffMins} menit`;
+    }
+  }
+
+  const [dailyOperationActivityData] = await pool.query(
+    "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') as operation_day FROM orders WHERE robot_id = ? AND created_at >= CURDATE() - INTERVAL 6 DAY GROUP BY operation_day ORDER BY operation_day ASC",
+    [robotId]
+  );
+
+  const processedDailyOperationForChart = (
+    dailyOperationActivityData || []
+  ).map((dayData) => ({
+    log_day: dayData.operation_day,
+    is_active: 1,
+  }));
+
+  const dailyActiveStatusChart = getSevenDayArray(
+    processedDailyOperationForChart,
+    "is_active",
+    "log_day",
+    0
+  );
+
+  return { operatingTimeInfo, dailyActiveStatusChart };
+}
+
 async function fetchDataForType(type, robotId = null) {
   if (!pool) {
+    // ... (error handling sudah ada) ...
     console.error(
       `[${new Date().toISOString()}] DB Pool belum siap saat mencoba fetch data untuk tipe: ${type}`
     );
@@ -123,7 +184,7 @@ async function fetchDataForType(type, robotId = null) {
     };
   }
   let payloadArray = null;
-  let eventName = ""; // Nama event Socket.IO yang akan di-emit
+  let eventName = "";
 
   try {
     if (type === "all_with_logs") {
@@ -134,6 +195,9 @@ async function fetchDataForType(type, robotId = null) {
       const robotsOutput = [];
       for (const robot_entry of robots_from_battery_data || []) {
         const robot_id_key = robot_entry.id;
+        const { operatingTimeInfo, dailyActiveStatusChart } =
+          await getRobotOperationalMetrics(robot_id_key);
+
         const current_robot_output = {
           id: parseInt(robot_entry.id, 10),
           name: robot_entry.name || "N/A",
@@ -147,11 +211,13 @@ async function fetchDataForType(type, robotId = null) {
               ? parseInt(robot_entry.battery_performance, 10)
               : null,
           timestamp: robot_entry.timestamp,
+          operatingTime: operatingTimeInfo,
           orderLogDetails: [],
           actualChartData: {
-            dailyCompletedOrders: [],
+            dailyCompletedOrders: [], // Akan diisi di bawah
             dailyAvgBattery: [],
             dailyAvgPerformance: [],
+            dailyActiveStatus: dailyActiveStatusChart,
           },
         };
         const [raw_robot_logs] = await pool.query(
@@ -169,6 +235,9 @@ async function fetchDataForType(type, robotId = null) {
               case 1:
                 status_desc = `Pesanan meja ${tableNum} selesai diantarkan`;
                 break;
+              case 2:
+                status_desc = `Pesanan meja ${tableNum} selesai diantarkan`;
+                break;
             }
             return {
               timestamp_raw: log_entry.created_at,
@@ -176,12 +245,24 @@ async function fetchDataForType(type, robotId = null) {
             };
           }
         );
+
+        // Query untuk dailyCompletedOrders (semua order)
+        // console.log(`[DEBUG] Mengambil chart_orders_data untuk robot_id: ${robot_id_key}`); // Aktifkan untuk debug
         const [chart_orders_data] = await pool.query(
-          "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') as log_day, COUNT(*) as order_count FROM orders WHERE robot_id = ? AND status = 2 AND created_at >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
+          "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') as log_day, COUNT(*) as order_count FROM orders WHERE robot_id = ? AND created_at >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
           [robot_id_key]
         );
+        // console.log(`[DEBUG] Robot ID: ${robot_id_key} - Hasil MENTAH chart_orders_data dari SQL:`, JSON.stringify(chart_orders_data, null, 2)); // Aktifkan untuk debug
+
+        const dailyOrdersArray = getSevenDayArray(
+          chart_orders_data,
+          "order_count"
+        );
+        // console.log(`[DEBUG] Robot ID: ${robot_id_key} - Hasil PROSES dailyCompletedOrders untuk chart:`, JSON.stringify(dailyOrdersArray, null, 2)); // Aktifkan untuk debug
         current_robot_output.actualChartData.dailyCompletedOrders =
-          getSevenDayArray(chart_orders_data, "order_count");
+          dailyOrdersArray;
+
+        // ... (query untuk dailyAvgBattery dan dailyAvgPerformance sudah ada dan benar) ...
         const [chart_battery_data] = await pool.query(
           "SELECT DATE_FORMAT(timestamp, '%Y-%m-%d') as log_day, AVG(battery_percentage) as avg_battery FROM battery_data WHERE id = ? AND timestamp >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
           [robot_id_key]
@@ -196,10 +277,12 @@ async function fetchDataForType(type, robotId = null) {
         );
         current_robot_output.actualChartData.dailyAvgPerformance =
           getSevenDayArray(chart_performance_data, "avg_performance");
+
         robotsOutput.push(current_robot_output);
       }
       payloadArray = robotsOutput;
     } else if (type === "single_latest") {
+      // ... (kode tidak berubah) ...
       eventName = "single_latest_update";
       const [rows] = await pool.query(
         "SELECT id, name, serial, battery_percentage, mode, battery_performance, timestamp FROM battery_data ORDER BY timestamp DESC LIMIT 1"
@@ -221,9 +304,10 @@ async function fetchDataForType(type, robotId = null) {
           timestamp: row.timestamp,
         };
       } else {
-        payloadArray = null; // Tidak ada data
+        payloadArray = null;
       }
     } else if (type === "all_robots_simple") {
+      // ... (kode tidak berubah) ...
       eventName = "all_robots_simple_update";
       const [robotsSimpleRaw] = await pool.query(
         "SELECT id, name, serial, battery_percentage, mode, battery_performance, timestamp FROM battery_data ORDER BY id ASC"
@@ -243,20 +327,20 @@ async function fetchDataForType(type, robotId = null) {
         timestamp: r.timestamp,
       }));
     } else if (type === "robot_detail" && robotId) {
-      // Untuk robot_detail, kita akan memanggil fungsi spesifiknya
-      // eventName akan diset di dalam fetchRobotDetailData jika perlu (atau dikirim ke room tertentu)
-      payloadArray = await fetchRobotDetailData(robotId); // fetchRobotDetailData akan mengembalikan objek data atau objek error
+      payloadArray = await fetchRobotDetailData(robotId); // fetchRobotDetailData sudah memanggil getRobotOperationalMetrics dan query dailyCompletedOrders yang benar
       if (payloadArray && !payloadArray.error) {
-        eventName = `robot_detail_update_${robotId}`; // Event name spesifik per robot ID
+        eventName = `robot_detail_update`;
       } else if (payloadArray && payloadArray.error) {
-        eventName = "stream_error"; // Atau event error spesifik
+        eventName = "stream_error";
       }
     } else if (type === "robot_detail" && !robotId) {
+      // ... (error handling sudah ada) ...
       eventName = "stream_error";
       payloadArray = { error: "Robot ID tidak diberikan untuk robot_detail." };
     }
     return { eventName, payloadArray };
   } catch (error) {
+    // ... (error handling sudah ada) ...
     console.error(
       `[${new Date().toISOString()}] DB Error fetchDataForType (type: ${type}, robotId: ${robotId}):`,
       error.message
@@ -273,6 +357,7 @@ async function fetchDataForType(type, robotId = null) {
 
 async function fetchRobotDetailData(robotId) {
   if (!pool) {
+    // ... (error handling sudah ada) ...
     console.error(
       `DB Pool not initialized for fetchRobotDetailData (ID: ${robotId})`
     );
@@ -285,6 +370,9 @@ async function fetchRobotDetailData(robotId) {
     );
     if (rows.length > 0) {
       const robot_data_raw = rows[0];
+      const { operatingTimeInfo, dailyActiveStatusChart } =
+        await getRobotOperationalMetrics(robotId);
+
       const robot_data = {
         id: parseInt(robot_data_raw.id, 10),
         name: robot_data_raw.name || "N/A",
@@ -298,11 +386,13 @@ async function fetchRobotDetailData(robotId) {
             ? parseInt(robot_data_raw.battery_performance, 10)
             : null,
         timestamp: robot_data_raw.timestamp,
+        operatingTime: operatingTimeInfo,
         orderLogDetails: [],
         actualChartData: {
-          dailyCompletedOrders: [],
+          dailyCompletedOrders: [], // Akan diisi di bawah
           dailyAvgBattery: [],
           dailyAvgPerformance: [],
+          dailyActiveStatus: dailyActiveStatusChart,
         },
       };
       const [raw_robot_logs] = await pool.query(
@@ -317,8 +407,8 @@ async function fetchRobotDetailData(robotId) {
             status_desc = `Pesanan baru untuk meja ${tableNum}`;
             break;
           case 1:
-            status_desc = `Mengantarkan pesanan ke meja ${tableNum}`;
-            break;
+            status_desc = `Pesanan meja ${tableNum} selesai diantarkan`;
+            break; // Note: case 1 dan 2 di all_with_logs berbeda dengan ini. Konsistensi mungkin diperlukan.
           case 2:
             status_desc = `Pesanan meja ${tableNum} selesai diantarkan`;
             break;
@@ -331,14 +421,23 @@ async function fetchRobotDetailData(robotId) {
           description: status_desc,
         };
       });
+
+      // Query untuk dailyCompletedOrders (semua order)
+      // console.log(`[DEBUG] Mengambil chart_orders_data untuk robot_id: ${robotId} (dalam fetchRobotDetailData)`); // Aktifkan untuk debug
       const [chart_orders_data] = await pool.query(
-        "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') as log_day, COUNT(*) as order_count FROM orders WHERE robot_id = ? AND status = 2 AND created_at >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
+        "SELECT DATE_FORMAT(created_at, '%Y-%m-%d') as log_day, COUNT(*) as order_count FROM orders WHERE robot_id = ? AND created_at >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
         [robotId]
       );
-      robot_data.actualChartData.dailyCompletedOrders = getSevenDayArray(
+      // console.log(`[DEBUG] Robot ID: ${robotId} - Hasil MENTAH chart_orders_data dari SQL (dalam fetchRobotDetailData):`, JSON.stringify(chart_orders_data, null, 2)); // Aktifkan untuk debug
+
+      const dailyOrdersArrayDetail = getSevenDayArray(
         chart_orders_data,
         "order_count"
       );
+      // console.log(`[DEBUG] Robot ID: ${robotId} - Hasil PROSES dailyCompletedOrders untuk chart (dalam fetchRobotDetailData):`, JSON.stringify(dailyOrdersArrayDetail, null, 2)); // Aktifkan untuk debug
+      robot_data.actualChartData.dailyCompletedOrders = dailyOrdersArrayDetail;
+
+      // ... (query untuk dailyAvgBattery dan dailyAvgPerformance sudah ada dan benar) ...
       const [chart_battery_data] = await pool.query(
         "SELECT DATE_FORMAT(timestamp, '%Y-%m-%d') as log_day, AVG(battery_percentage) as avg_battery FROM battery_data WHERE id = ? AND timestamp >= CURDATE() - INTERVAL 6 DAY GROUP BY log_day ORDER BY log_day ASC",
         [robotId]
@@ -357,11 +456,13 @@ async function fetchRobotDetailData(robotId) {
       );
       return robot_data;
     }
+    // ... (error handling sudah ada) ...
     return {
       error: "Data baterai (robot) tidak ditemukan",
       id_requested: robotId,
     };
   } catch (error) {
+    // ... (error handling sudah ada) ...
     console.error(
       `[${new Date().toISOString()}] DB Error fetchRobotDetailData for ID ${robotId}:`,
       error.message
@@ -373,6 +474,7 @@ async function fetchRobotDetailData(robotId) {
   }
 }
 
+// ... (endpoint /internal/broadcast, middleware io.use, io.on('connection'), setInterval, httpServer.listen tidak berubah) ...
 // Endpoint internal untuk menerima broadcast dari PHP
 app.post("/internal/broadcast", (req, res) => {
   const internalToken = req.headers["x-internal-auth-token"];
@@ -405,7 +507,7 @@ app.post("/internal/broadcast", (req, res) => {
     res.status(200).send({ status: "success", message: "Event broadcasted" });
   } else {
     console.error(
-      `[${new Date().toISOString()}] Gagal json_encode data untuk broadcast dari PHP, event: ${eventName}`
+      `[${new Date().toISOString()}] Gagal JSON.stringify data untuk broadcast dari PHP, event: ${eventName}`
     );
     res.status(500).send({
       status: "error",
@@ -458,10 +560,8 @@ io.on("connection", (socket) => {
     userId: socket.userData?.userId,
   });
 
-  // Klien bisa meminta data awal setelah terhubung dan terautentikasi
   socket.on("request_initial_data", async (request) => {
     if (!socket.userData) {
-      // Pastikan sudah terautentikasi
       socket.emit(
         "stream_error",
         JSON.stringify({ message: "Tidak terautentikasi untuk meminta data." })
@@ -481,28 +581,28 @@ io.on("connection", (socket) => {
     const result = await fetchDataForType(type, robotId);
 
     if (result && result.payloadArray && result.eventName) {
-      if (result.payloadArray.error) {
-        // Jika fungsi fetch mengembalikan objek error
-        socket.emit("stream_error", JSON.stringify(result.payloadArray));
-      } else {
-        const jsonData = JSON.stringify(result.payloadArray);
-        if (jsonData) {
-          socket.emit(result.eventName, jsonData); // Kirim hanya ke socket yang meminta
+      const jsonData = JSON.stringify(result.payloadArray);
+      if (jsonData) {
+        if (type === "robot_detail" && robotId && !result.payloadArray.error) {
+          socket.emit("robot_detail_update", jsonData);
+        } else if (result.payloadArray.error) {
+          socket.emit("stream_error", jsonData);
         } else {
-          console.error(
-            `[${new Date().toISOString()}] Gagal json_encode data awal untuk klien ${
-              socket.id
-            }, type: ${type}`
-          );
-          socket.emit(
-            "stream_error",
-            JSON.stringify({ message: "Gagal encode data awal." })
-          );
+          socket.emit(result.eventName, jsonData);
         }
+      } else {
+        console.error(
+          `[${new Date().toISOString()}] Gagal JSON.stringify data awal untuk klien ${
+            socket.id
+          }, type: ${type}`
+        );
+        socket.emit(
+          "stream_error",
+          JSON.stringify({ message: "Gagal encode data awal." })
+        );
       }
     } else if (result && result.payloadArray === null && result.eventName) {
-      // Tidak ada data tapi eventName ada
-      socket.emit(result.eventName, JSON.stringify([])); // Kirim array kosong jika diharapkan array
+      socket.emit(result.eventName, JSON.stringify(null));
     } else {
       console.warn(
         `[${new Date().toISOString()}] Tidak ada data atau event name untuk dikirim ke klien ${
@@ -510,8 +610,7 @@ io.on("connection", (socket) => {
         } untuk initial_data type: ${type}`
       );
       if (result && result.eventName) {
-        // Jika eventName ada tapi payload null
-        socket.emit(result.eventName, JSON.stringify(null)); // Kirim null jika itu yang sesuai
+        socket.emit(result.eventName, JSON.stringify(null));
       }
     }
   });
@@ -525,14 +624,11 @@ io.on("connection", (socket) => {
   });
 });
 
-// Timer periodik untuk mengirim pembaruan data ke semua klien
+// Timer periodik
 setInterval(async () => {
   if (Object.keys(io.sockets.sockets).length === 0) {
-    // Hanya proses jika ada klien terhubung
-    // console.log(`[${new Date().toISOString()}] Timer: Tidak ada klien terhubung, skip broadcast.`);
     return;
   }
-  // console.log(`[${new Date().toISOString()}] Timer: Memeriksa pembaruan data untuk disiarkan...`);
 
   const typesToBroadcast = [
     "all_robots_simple",
@@ -540,7 +636,7 @@ setInterval(async () => {
     "single_latest",
   ];
   for (const type of typesToBroadcast) {
-    const result = await fetchDataForType(type); // robotId tidak relevan untuk broadcast global ini
+    const result = await fetchDataForType(type);
 
     if (
       result &&
@@ -551,38 +647,30 @@ setInterval(async () => {
       const encoded = JSON.stringify(result.payloadArray);
       if (!encoded) {
         console.error(
-          `[${new Date().toISOString()}] Timer: Gagal json_encode untuk tipe ${type}`
+          `[${new Date().toISOString()}] Timer: Gagal JSON.stringify untuk tipe ${type}`
         );
-        continue; // Lanjut ke tipe berikutnya jika encoding gagal
+        continue;
       }
 
-      let comparisonKey = type;
       let lastSentJson = lastSentPayloads[type];
 
       if (type === "single_latest") {
-        // Untuk single_latest, payloadArray adalah objek tunggal.
-        // lastSentPayloads.single_latest menyimpan objek, jadi kita encode untuk perbandingan.
         lastSentJson = lastSentPayloads.single_latest
           ? JSON.stringify(lastSentPayloads.single_latest)
           : null;
       }
 
       if (encoded !== lastSentJson) {
-        io.emit(result.eventName, encoded); // Siarkan ke semua klien
+        io.emit(result.eventName, encoded);
         if (type === "single_latest") {
-          lastSentPayloads.single_latest = result.payloadArray; // Simpan objeknya
+          lastSentPayloads.single_latest = result.payloadArray;
         } else {
-          lastSentPayloads[type] = encoded; // Simpan JSON string
+          lastSentPayloads[type] = encoded;
         }
-        console.log(
-          `[${new Date().toISOString()}] Timer: Emitted ${
-            result.eventName
-          } ke ${Object.keys(io.sockets.sockets).length} klien`
-        );
       }
     }
   }
-}, 3000); // Setiap 3 detik
+}, 3000);
 
 const PORT = process.env.SOCKET_IO_PORT || 3000;
 httpServer.listen(PORT, () => {
